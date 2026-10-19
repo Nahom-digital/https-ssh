@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch /etc/default/https-ssh and restart https-ssh on change
+
+[Path]
+PathChanged=/etc/default/https-ssh
+Unit=https-ssh-restart.service
+
+[Install]
+WantedBy=multi-user.target

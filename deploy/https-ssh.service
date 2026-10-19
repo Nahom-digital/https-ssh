@@ -1,0 +1,21 @@
+[Unit]
+Description=https-ssh - SSH over HTTP/HTTPS gateway
+Documentation=https://github.com/Nahom-digital/https-ssh#readme
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+# All settings live in /etc/default/https-ssh
+EnvironmentFile=-/etc/default/https-ssh
+ExecStart=/usr/local/bin/https-ssh serve
+# bring it back after a crash, and after a config change (see https-ssh-restart.path)
+Restart=always
+RestartSec=3
+# let the app shut down cleanly (it handles SIGINT)
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1392 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+https-ssh - run SSH over plain HTTP/HTTPS.
+
+Why: Cloudflare Tunnel (cloudflared) only speaks HTTP, so a plain `ssh` to a
+tunnelled host does not work. This service listens on a local HTTP port,
+authenticates the POSTed credentials against the real sshd, and then carries the
+SSH session over a websocket - the one streaming transport Cloudflare supports.
+
+Layout of the two sides
+-----------------------
+  client  --HTTPS-->  Cloudflare  --HTTP-->  https-ssh serve  --TCP-->  sshd
+  (ssh)                                      (127.0.0.1:8899)          (localhost)
+
+Auth model
+----------
+  * POST /login {host, port, user, password|key} runs the REAL `ssh` binary
+    against the target and returns a token ONLY if sshd accepted the credentials.
+    Whatever sshd accepts, this gateway accepts - no second password database.
+  * The token is bound to (user, host, port). /tunnel and /exec can only reach
+    that exact target, so a token can never be used as an open relay.
+  * /tunnel is a websocket that carries raw sshd bytes, which makes it usable
+    with `ssh -o ProxyCommand` - plain ssh, scp, sftp and -L forwarding all work.
+
+Subcommands
+-----------
+  serve                     run the HTTP gateway (this is the "service")
+  login  USER@HOST          verify credentials via POST /login, store the token
+  connect USER@HOST         login (if needed) + open a real interactive ssh
+  proxy  HOST PORT          websocket tunnel client, used as ssh ProxyCommand
+  exec   USER@HOST -- CMD   run one command over HTTPS only (no local ssh)
+  status | logout           inspect / drop stored tokens
+
+Only the Python standard library is used. The real `ssh` binary does the actual
+authentication, so whatever sshd accepts, this accepts.
+"""
+
+import argparse
+import base64
+import getpass
+import hashlib
+import json
+import os
+import secrets
+import shlex
+import shutil
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+VERSION = "1.1.0"
+DEFAULT_PORT = 8899          # where the https-ssh service listens
+DEFAULT_SSH_PORT = 22        # where sshd is expected to listen
+DEFAULT_GATEWAY = os.environ.get("HTTPS_SSH_GATEWAY", "http://127.0.0.1:%d" % DEFAULT_PORT)
+STATE_DIR = os.path.expanduser("~/.https-ssh")
+SESSIONS_FILE = os.path.join(STATE_DIR, "sessions.json")
+KNOWN_HOSTS = os.path.join(STATE_DIR, "known_hosts")
+TOKEN_TTL = int(os.environ.get("HTTPS_SSH_TTL", 8 * 3600))   # seconds
+IDLE_TIMEOUT = int(os.environ.get("HTTPS_SSH_IDLE", 900))    # tunnel idle seconds
+LOGIN_TIMEOUT = int(os.environ.get("HTTPS_SSH_LOGIN_TIMEOUT", 20))
+
+# Every login attempt is appended to log.json, next to this application.
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.environ.get("HTTPS_SSH_LOG") or os.path.join(APP_DIR, "log.json")
+LOG_MAX = int(os.environ.get("HTTPS_SSH_LOG_MAX", 5000))     # keep last N entries
+
+
+# --------------------------------------------------------------------------- #
+# small helpers
+# --------------------------------------------------------------------------- #
+def log(msg):
+    sys.stderr.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+    sys.stderr.flush()
+
+
+def ensure_state_dir():
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def load_sessions():
+    try:
+        with open(SESSIONS_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_sessions(data):
+    ensure_state_dir()
+    tmp = SESSIONS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SESSIONS_FILE)
+
+
+def session_key(gateway, user, host, port):
+    return "%s|%s@%s:%d" % (gateway.rstrip("/"), user, host, port)
+
+
+# --------------------------------------------------------------------------- #
+# login log - every attempt lands in ~/https-ssh/log.json
+# --------------------------------------------------------------------------- #
+_LOG_LOCK = threading.Lock()
+
+
+def set_log_file(path):
+    global LOG_FILE
+    if path:
+        LOG_FILE = os.path.abspath(os.path.expanduser(path))
+
+
+def record_login(ok, user, host, port, method=None, reason=None, remote=None, client=None):
+    """Append one login attempt to log.json (a JSON array, newest last)."""
+    entry = {
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "epoch": int(time.time()),
+        "event": "login",
+        "ok": bool(ok),
+        "user": user,
+        "host": host,
+        "port": port,
+        "method": method,
+        "remote": remote,
+        "client": client or None,
+    }
+    if reason:
+        entry["reason"] = reason
+    with _LOG_LOCK:
+        try:
+            with open(LOG_FILE) as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                data = []
+        except (OSError, ValueError):
+            data = []
+        data.append(entry)
+        if len(data) > LOG_MAX:
+            data = data[-LOG_MAX:]
+        tmp = LOG_FILE + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, LOG_FILE)
+        except OSError as exc:
+            log("WARNING: cannot write login log %s: %s" % (LOG_FILE, exc))
+
+
+def env_int(name, fallback):
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return fallback
+
+
+def prompt_password(user, host):
+    """Ask for a password. Piped stdin is accepted, and a missing terminal
+    produces a clean error instead of a traceback."""
+    if not sys.stdin.isatty():
+        line = sys.stdin.readline()
+        if not line:
+            raise SystemExit("no password given; use -p/--password or run from a terminal")
+        return line.rstrip("\r\n")
+    try:
+        return getpass.getpass("SSH password for %s@%s: " % (user, host))
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit("no password given; use -p/--password or run from a terminal")
+
+
+def split_target(spec, default_port=22):
+    """Accept user@host, user@host:port, host (user defaults to $USER)."""
+    if "@" in spec:
+        user, rest = spec.split("@", 1)
+    else:
+        user, rest = os.environ.get("USER", "root"), spec
+    rest = rest.strip("/")
+    if ":" in rest and not rest.startswith("["):
+        host, _, p = rest.rpartition(":")
+        if p.isdigit():
+            return user, host, int(p)
+    return user, rest, default_port
+
+
+# --------------------------------------------------------------------------- #
+# credential verification - delegated to the real ssh binary
+# --------------------------------------------------------------------------- #
+_ASKPASS_DIR = None
+
+
+def askpass_helper():
+    """A tiny script that prints the password from the environment (never on disk)."""
+    global _ASKPASS_DIR
+    if _ASKPASS_DIR is None:
+        _ASKPASS_DIR = tempfile.mkdtemp(prefix="https-ssh-")
+        os.chmod(_ASKPASS_DIR, 0o700)
+        path = os.path.join(_ASKPASS_DIR, "askpass.sh")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\nprintf '%s\\n' \"$HTTPS_SSH_PW\"\n")
+        os.chmod(path, 0o700)
+        _ASKPASS_DIR = (path,)
+    return _ASKPASS_DIR[0]
+
+
+def materialize_key(key):
+    """`key` is either a path on this host or the literal key material.
+
+    Returns (path, is_temp). Clients (e.g. https-ssh-client.sh) may send the
+    private key text itself, which is written to a 0600 temp file and removed
+    as soon as the check is done.
+    """
+    if "\n" in key or "PRIVATE KEY" in key:
+        fd, path = tempfile.mkstemp(prefix="https-ssh-key-", suffix=".pem")
+        try:
+            os.write(fd, key.encode())
+        finally:
+            os.close(fd)
+        os.chmod(path, 0o600)
+        return path, True
+    return os.path.expanduser(key), False
+
+
+def verify_ssh(host, port, user, password=None, key=None, timeout=LOGIN_TIMEOUT):
+    """Return (ok, method, detail). Runs the real ssh, so sshd is the judge."""
+    ssh = shutil.which("ssh")
+    if not ssh:
+        return False, "unavailable", "the 'ssh' binary was not found on this host"
+
+    temp_key = None
+
+    base = [
+        ssh,
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "UserKnownHostsFile=" + KNOWN_HOSTS,
+        "-o", "LogLevel=ERROR",
+        "-o", "NumberOfPasswordPrompts=1",
+        "-o", "ConnectTimeout=%d" % min(timeout, 15),
+        "-o", "RequestTTY=no",
+        "-p", str(port),
+    ]
+
+    env = dict(os.environ)
+    if password is not None:
+        helper = askpass_helper()
+        base += [
+            "-o", "PreferredAuthentications=password,keyboard-interactive",
+            "-o", "PubkeyAuthentication=no",
+            "-o", "BatchMode=no",
+        ]
+        env["SSH_ASKPASS"] = helper
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        env["DISPLAY"] = env.get("DISPLAY", ":0")   # old-ssh fallback
+        env["HTTPS_SSH_PW"] = password
+        method = "password"
+        if shutil.which("setsid"):
+            base = ["setsid", "-w"] + base
+    elif key:
+        key_path, is_temp = materialize_key(key)
+        if is_temp:
+            temp_key = key_path
+        base += [
+            "-o", "PreferredAuthentications=publickey",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "BatchMode=yes",
+            "-i", key_path,
+        ]
+        method = "publickey"
+    else:
+        return False, "none", "no password or key supplied"
+
+    cmd = base + ["%s@%s" % (user, host), "true"]
+    try:
+        try:
+            proc = subprocess.run(
+                cmd, env=env, timeout=timeout,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+        except subprocess.TimeoutExpired:
+            return False, method, "ssh to %s:%d timed out after %ds" % (host, port, timeout)
+        except OSError as exc:
+            return False, method, "could not run ssh: %s" % exc
+    finally:
+        if temp_key:
+            try:
+                os.unlink(temp_key)
+            except OSError:
+                pass
+
+    err = proc.stderr.decode("utf-8", "replace").strip()
+    if proc.returncode == 0:
+        return True, method, "sshd accepted the credentials"
+    if "Permission denied" in err or "Authentication failed" in err:
+        return False, method, "sshd rejected the credentials (permission denied)"
+    if "Connection refused" in err:
+        return False, method, "connection refused by %s:%d" % (host, port)
+    if "Connection timed out" in err or "Connection closed" in err:
+        return False, method, "could not reach %s:%d" % (host, port)
+    return False, method, err.splitlines()[-1] if err else "ssh exited with %d" % proc.returncode
+
+
+# --------------------------------------------------------------------------- #
+# token store
+# --------------------------------------------------------------------------- #
+class TokenStore:
+    def __init__(self):
+        self._tokens = {}
+        self._failures = {}
+
+    def create(self, user, host, port, method, credential=None):
+        token = secrets.token_urlsafe(32)
+        self._tokens[token] = {
+            "user": user, "host": host, "port": port,
+            "method": method, "created": time.time(),
+            "expires": time.time() + TOKEN_TTL,
+            # kept in memory only, so /exec can reuse the verified identity.
+            # never written to disk, never logged, never returned by the API.
+            "credential": credential or {},
+        }
+        return token
+
+    def public_sessions(self):
+        now = time.time()
+        return [
+            {"user": r["user"], "host": r["host"], "port": r["port"],
+             "method": r["method"], "expires_in": int(r["expires"] - now)}
+            for r in self._tokens.values() if r["expires"] > now
+        ]
+
+    def get(self, token):
+        rec = self._tokens.get(token)
+        if not rec:
+            return None
+        if rec["expires"] < time.time():
+            self._tokens.pop(token, None)
+            return None
+        return rec
+
+    def drop_user(self, user, host, port):
+        gone = 0
+        for tok, rec in list(self._tokens.items()):
+            if (rec["user"], rec["host"], rec["port"]) == (user, host, port):
+                self._tokens.pop(tok, None)
+                gone += 1
+        return gone
+
+    def revoke(self, token):
+        return self._tokens.pop(token, None) is not None if token else False
+
+    # gentle brute-force brake in front of the real sshd
+    def throttle(self, ip):
+        rec = self._failures.get(ip)
+        if not rec:
+            return 0
+        return max(0, rec["until"] - time.time())
+
+    def record_failure(self, ip):
+        rec = self._failures.setdefault(ip, {"count": 0, "until": 0})
+        rec["count"] += 1
+        if rec["count"] >= 3:
+            rec["until"] = time.time() + min(30 * (rec["count"] - 2), 300)
+
+    def record_success(self, ip):
+        self._failures.pop(ip, None)
+
+
+TOKENS = TokenStore()
+
+
+# --------------------------------------------------------------------------- #
+# WebSocket transport (RFC 6455, minimal: binary frames, no extensions)
+#
+# Why websockets and not a plain HTTP/1.1 "Upgrade: raw-tunnel"? Because
+# Cloudflare's proxy answers 400 to requests that carry an unknown Upgrade
+# header, and normalises a 101 from the origin. Websocket upgrades are the one
+# streaming transport Cloudflare Tunnel fully supports, so that is what we use.
+# --------------------------------------------------------------------------- #
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def ws_accept(key):
+    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+
+
+class WebSocket:
+    """Just enough of RFC 6455 to move a byte stream. Payloads are not masked
+    unless mask=True (clients mask, servers do not)."""
+
+    def __init__(self, sock, mask=False, initial=b""):
+        self.sock = sock
+        self.mask = mask
+        self.buf = bytearray(initial)
+        self.lock = threading.Lock()
+
+    # ---- low level ---- #
+    def _read_exact(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("websocket closed")
+            self.buf += chunk
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def send_frame(self, opcode, payload=b""):
+        b1 = 0x80 | opcode              # FIN set, no fragmentation on send
+        length = len(payload)
+        if length < 126:
+            header = struct.pack("!BB", b1, length | (0x80 if self.mask else 0))
+        elif length < 65536:
+            header = struct.pack("!BBH", b1, 126 | (0x80 if self.mask else 0), length)
+        else:
+            header = struct.pack("!BBQ", b1, 127 | (0x80 if self.mask else 0), length)
+        if self.mask:
+            key = os.urandom(4)
+            header += key
+            payload = bytes(payload[i] ^ key[i % 4] for i in range(length))
+        with self.lock:
+            self.sock.sendall(header + payload)
+
+    def recv_message(self):
+        """Return (opcode, payload); (None, None) once the peer closes."""
+        data = b""
+        first_op = None
+        while True:
+            b1, b2 = self._read_exact(2)
+            fin = b1 & 0x80
+            opcode = b1 & 0x0F
+            masked = b2 & 0x80
+            length = b2 & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._read_exact(8))[0]
+            key = self._read_exact(4) if masked else None
+            payload = self._read_exact(length) if length else b""
+            if key:
+                payload = bytes(payload[i] ^ key[i % 4] for i in range(len(payload)))
+
+            if opcode == 0x8:                       # close
+                return None, None
+            if opcode == 0x9:                       # ping -> pong
+                self.send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:                       # pong
+                continue
+
+            if opcode in (0x1, 0x2):                # text/binary
+                first_op = opcode
+                data = payload
+            elif opcode == 0x0:                     # continuation
+                data += payload
+            if fin:
+                return first_op, data
+
+
+def ws_bridge(ws, upstream, idle):
+    """Pump bytes between a websocket and a raw TCP socket until either ends."""
+    def ws_to_up():
+        try:
+            while True:
+                op, data = ws.recv_message()
+                if op is None:
+                    break
+                if data:
+                    upstream.sendall(data)
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            try:
+                upstream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                upstream.close()
+            except OSError:
+                pass
+
+    def up_to_ws():
+        try:
+            while True:
+                data = upstream.recv(65536)
+                if not data:
+                    break
+                ws.send_frame(0x2, data)
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            try:
+                ws.send_frame(0x8)          # clean websocket close
+            except Exception:
+                pass
+            try:
+                ws.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    ws.sock.settimeout(idle)
+    a = threading.Thread(target=ws_to_up, daemon=True)
+    b = threading.Thread(target=up_to_ws, daemon=True)
+    a.start()
+    b.start()
+    a.join()
+    b.join()
+
+
+def ws_client_bridge(ws, in_fd, out_fd, idle):
+    """Client side: pump stdin/stdout to and from the websocket."""
+    done = threading.Event()
+
+    def stdin_to_ws():
+        try:
+            while not done.is_set():
+                data = os.read(in_fd, 65536)
+                if not data:
+                    break
+                ws.send_frame(0x2, data)
+        except (OSError, ConnectionError):
+            pass
+
+    def ws_to_stdout():
+        try:
+            while True:
+                op, data = ws.recv_message()
+                if op is None:
+                    break
+                if data:
+                    os.write(out_fd, data)
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            done.set()
+
+    def keepalive():
+        # Cloudflare drops idle websockets after ~100s; keep it warm
+        while not done.wait(30):
+            try:
+                ws.send_frame(0x9, b"")
+            except Exception:
+                break
+
+    ws.sock.settimeout(idle)
+    ta = threading.Thread(target=stdin_to_ws, daemon=True)
+    tb = threading.Thread(target=ws_to_stdout, daemon=True)
+    tc = threading.Thread(target=keepalive, daemon=True)
+    ta.start()
+    tb.start()
+    tc.start()
+    tb.join()       # remote end closed -> the proxy is finished
+    done.set()
+
+
+# --------------------------------------------------------------------------- #
+# HTTP gateway
+# --------------------------------------------------------------------------- #
+class Gateway(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "https-ssh/" + VERSION
+    sys_version = ""
+    # Unbuffered reads: the request headers are read byte-by-byte, so nothing
+    # can be silently buffered past "\r\n\r\n". That matters because /tunnel
+    # switches to a raw websocket on the very same socket.
+    rbufsize = 0
+    wbufsize = 0
+
+    # silence the noisy default logging, keep it on stderr with a timestamp
+    def log_message(self, fmt, *args):
+        log("%s - %s" % (self._client_ip(), fmt % args))
+
+    # Never echo raw request bytes: a header/body desync could otherwise write a
+    # password straight into the log file.
+    def log_request(self, code="-", size="-"):
+        try:
+            parts = (self.requestline or "").split(" ")
+            method, target = (parts[0], parts[1]) if len(parts) >= 2 else ("?", "")
+            if not target.startswith("/"):
+                method, target = "MALFORMED", "<not echoed>"
+            self.log_message('"%s %s" %s', method, target, code)
+        except Exception:
+            pass
+
+    def log_error(self, fmt, *args):
+        msg = fmt % args if args else fmt
+        if "Bad request" in msg or "Bad HTTP" in msg or "Bad status" in msg:
+            self.log_message("bad request from %s (details suppressed)", self._client_ip())
+            return
+        self.log_message("%s", msg)
+
+    # ---------------- plumbing ---------------- #
+    def _json(self, code, payload):
+        body = json.dumps(payload, indent=2).encode() + b"\n"
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self):
+        """Always consume Content-Length, even when we are about to reject the
+        request - an unread body desynchronises keep-alive connections."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return b""
+        if length > 1024 * 1024:
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+            return b""
+        return self.rfile.read(length)
+
+    def _body(self):
+        raw = getattr(self, "_raw", b"")
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            return None
+
+    def _token(self):
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return (self.headers.get("X-Auth-Token") or "").strip() or None
+
+    def _local(self):
+        return self.client_address[0] in ("127.0.0.1", "::1", "localhost")
+
+    def _client_ip(self):
+        """The real client address, even when the request arrives via a tunnel.
+
+        Through cloudflared every connection comes from loopback, so the actual
+        address is carried in CF-Connecting-IP (Cloudflare) and the proxy chain
+        in X-Forwarded-For. Those headers are only honoured when the TCP peer is
+        loopback (i.e. a local tunnel/agent), so a client that reaches the
+        gateway directly cannot spoof its own address.
+        """
+        peer = self.client_address[0]
+        if peer not in ("127.0.0.1", "::1", "localhost"):
+            return peer
+        for header in ("CF-Connecting-IP", "True-Client-IP", "X-Real-IP"):
+            value = (self.headers.get(header) or "").strip()
+            if value:
+                return value
+        forwarded = (self.headers.get("X-Forwarded-For") or "").strip()
+        if forwarded:
+            first = forwarded.split(",")[0].strip()
+            if first:
+                return first
+        return peer
+
+    def _basic_credentials(self):
+        """(user, password) from an `Authorization: Basic` header, or None."""
+        auth = self.headers.get("Authorization", "")
+        if not auth.lower().startswith("basic "):
+            return None
+        try:
+            raw = base64.b64decode(auth[6:].strip()).decode("utf-8", "replace")
+        except Exception:
+            return None
+        if ":" not in raw:
+            return None
+        user, _, password = raw.partition(":")
+        return user, password
+
+    # ---------------- routes ---------------- #
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path in ("/", "/info"):
+            return self._info()
+        if path == "/health":
+            return self._json(200, {
+                "ok": True,
+                "service": "https-ssh",
+                "version": VERSION,
+                "ssh_host": "127.0.0.1",
+                "ssh_port": self.server.default_ssh_port,
+            })
+        if path == "/tunnel":
+            return self._tunnel()
+        if path == "/sessions":
+            if not self._local() and not self.server.gateway_secret:
+                return self._json(403, {"ok": False, "error": "forbidden"})
+            return self._json(200, {"ok": True, "sessions": TOKENS.public_sessions()})
+        return self._json(404, {"ok": False, "error": "not found", "path": path})
+
+    def do_POST(self):
+        self._raw = self._read_body()
+        path = urlparse(self.path).path
+        if path == "/login":
+            return self._login()
+        if path == "/exec":
+            return self._exec()
+        if path == "/logout":
+            return self._logout()
+        if path == "/tunnel":
+            return self._tunnel()
+        return self._json(404, {"ok": False, "error": "not found", "path": path})
+
+    def _info(self):
+        self._json(200, {
+            "ok": True,
+            "service": "https-ssh",
+            "version": VERSION,
+            "usage": {
+                "login": "POST /login {host, port, user, password|key} -> {token}",
+                "tunnel": "GET /tunnel  websocket; auth via Bearer token, ?token=, "
+                          "or Authorization: Basic <user:password>",
+                "exec": "POST /exec {token, command:[...]} -> {exit_code, stdout, stderr}",
+                "health": "GET /health",
+            },
+        })
+
+    def _login(self):
+        ip = self._client_ip()
+        agent = self.headers.get("User-Agent")
+        wait = TOKENS.throttle(ip)
+        if wait > 0:
+            record_login(False, None, None, None, reason="throttled", remote=ip, client=agent)
+            return self._json(429, {"ok": False, "error": "too many failures, retry in %.0fs" % wait})
+
+        if self.server.gateway_secret:
+            given = self.headers.get("X-Gateway-Secret", "")
+            if not secrets.compare_digest(given, self.server.gateway_secret):
+                record_login(False, None, None, None, reason="bad gateway secret",
+                             remote=ip, client=agent)
+                return self._json(401, {"ok": False, "error": "bad or missing X-Gateway-Secret"})
+
+        payload = self._body()
+        if payload is None:
+            record_login(False, None, None, None, reason="invalid JSON", remote=ip, client=agent)
+            return self._json(400, {"ok": False, "error": "body is not valid JSON"})
+
+        host = str(payload.get("host") or "").strip()
+        user = str(payload.get("user") or "").strip()
+        password = payload.get("password")
+        key = payload.get("key")
+        try:
+            # fall back to the port given with `https-ssh --ssh <port>`
+            port = int(payload.get("port") or self.server.default_ssh_port)
+        except (TypeError, ValueError):
+            record_login(False, user or None, host or None, None,
+                         reason="bad port", remote=ip, client=agent)
+            return self._json(400, {"ok": False, "error": "port must be a number"})
+
+        if not host or not user:
+            record_login(False, user or None, host or None, port,
+                         reason="host and user are required", remote=ip, client=agent)
+            return self._json(400, {"ok": False, "error": "host and user are required"})
+        if password is None and not key:
+            record_login(False, user, host, port, reason="no credentials supplied",
+                         remote=ip, client=agent)
+            return self._json(400, {"ok": False, "error": "password or key is required"})
+
+        ok, method, detail = verify_ssh(host, port, user, password, key)
+        if not ok:
+            TOKENS.record_failure(ip)
+            record_login(False, user, host, port, method=method, reason=detail,
+                         remote=ip, client=agent)
+            log("LOGIN FAIL %s@%s:%d via %s - %s" % (user, host, port, method, detail))
+            return self._json(401, {"ok": False, "error": detail, "method": method})
+
+        TOKENS.record_success(ip)
+        token = TOKENS.create(user, host, port, method,
+                              credential={"password": password, "key": key})
+        record_login(True, user, host, port, method=method, remote=ip, client=agent)
+        log("LOGIN OK   %s@%s:%d via %s" % (user, host, port, method))
+        return self._json(200, {
+            "ok": True, "token": token, "method": method,
+            "target": {"user": user, "host": host, "port": port},
+            "expires_in": TOKEN_TTL,
+        })
+
+    def _logout(self):
+        payload = self._body() or {}
+        token = payload.get("token") or self._token()
+        return self._json(200, {"ok": True, "revoked": TOKENS.revoke(token)})
+
+    def _exec(self):
+        payload = self._body() or {}
+        token = payload.get("token") or self._token()
+        rec = TOKENS.get(token) if token else None
+        if not rec:
+            return self._json(401, {"ok": False, "error": "invalid or expired token"})
+
+        command = payload.get("command")
+        if isinstance(command, list):
+            command = " ".join(shlex.quote(str(c)) for c in command)
+        if not isinstance(command, str) or not command.strip():
+            return self._json(400, {"ok": False, "error": "command must be a non-empty string or list"})
+
+        ssh = shutil.which("ssh")
+        if not ssh:
+            return self._json(500, {"ok": False, "error": "the 'ssh' binary was not found on this host"})
+
+        cred = rec.get("credential") or {}
+        env = dict(os.environ)
+        temp_key = None
+        base = [
+            ssh,
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "UserKnownHostsFile=" + KNOWN_HOSTS,
+            "-o", "LogLevel=ERROR",
+            "-o", "ConnectTimeout=15",
+            "-o", "NumberOfPasswordPrompts=1",
+            "-o", "RequestTTY=no",
+            "-p", str(rec["port"]),
+        ]
+        if cred.get("password") is not None:
+            # reuse the credential that /login already proved, from memory only
+            env["SSH_ASKPASS"] = askpass_helper()
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env["DISPLAY"] = env.get("DISPLAY", ":0")
+            env["HTTPS_SSH_PW"] = cred["password"]
+            base += ["-o", "BatchMode=no",
+                     "-o", "PreferredAuthentications=password,keyboard-interactive"]
+        elif cred.get("key"):
+            key_path, is_temp = materialize_key(cred["key"])
+            if is_temp:
+                temp_key = key_path
+            base += ["-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+                     "-i", key_path]
+        else:
+            return self._json(500, {"ok": False, "error": "session has no reusable credential"})
+
+        cmd = base + ["%s@%s" % (rec["user"], rec["host"]), command]
+        try:
+            try:
+                proc = subprocess.run(cmd, env=env, timeout=int(payload.get("timeout") or 60),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except subprocess.TimeoutExpired:
+                return self._json(504, {"ok": False, "error": "command timed out"})
+        finally:
+            if temp_key:
+                try:
+                    os.unlink(temp_key)
+                except OSError:
+                    pass
+        return self._json(200, {
+            "ok": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout.decode("utf-8", "replace"),
+            "stderr": proc.stderr.decode("utf-8", "replace"),
+        })
+
+    def _tunnel(self):
+        ip = self._client_ip()
+        agent = self.headers.get("User-Agent")
+
+        # The token may arrive as a bearer header (our own client) or as
+        # ?token=... (any standard websocket client, e.g. websocat).
+        query = parse_qs(urlparse(self.path).query)
+        token = self._token() or (query.get("token") or [None])[0]
+        rec = TOKENS.get(token) if token else None
+        target_is_fixed = False
+
+        if rec is None:
+            # Or the client authenticates inline with the SSH credentials,
+            # which are checked against the real sshd just like POST /login.
+            creds = self._basic_credentials()
+            if creds is None:
+                return self._json(401, {
+                    "ok": False,
+                    "error": "send Authorization: Bearer <token>, ?token=<token>, "
+                             "or Authorization: Basic <base64 user:password>",
+                })
+            user, password = creds
+            host, port = "127.0.0.1", self.server.default_ssh_port
+            wait = TOKENS.throttle(ip)
+            if wait > 0:
+                return self._json(429, {"ok": False,
+                                        "error": "too many failures, retry in %.0fs" % wait})
+            ok, method, detail = verify_ssh(host, port, user, password)
+            if not ok:
+                TOKENS.record_failure(ip)
+                record_login(False, user, host, port, method="basic", reason=detail,
+                             remote=ip, client=agent)
+                return self._json(401, {"ok": False, "error": detail})
+            TOKENS.record_success(ip)
+            record_login(True, user, host, port, method="basic", remote=ip, client=agent)
+            rec = {"user": user, "host": host, "port": port}
+            # with Basic auth the client cannot choose the target: no open relay
+            target_is_fixed = True
+
+        if target_is_fixed:
+            target_host, target_port = rec["host"], rec["port"]
+        else:
+            # A token can only reach the target it was minted for.
+            want_host = (self.headers.get("X-SSH-Host") or rec["host"]).strip()
+            try:
+                want_port = int(self.headers.get("X-SSH-Port") or rec["port"])
+            except ValueError:
+                return self._json(400, {"ok": False, "error": "X-SSH-Port must be a number"})
+            if (want_host, want_port) != (rec["host"], rec["port"]):
+                return self._json(403, {
+                    "ok": False,
+                    "error": "token is bound to %s@%s:%d" % (rec["user"], rec["host"], rec["port"]),
+                })
+            target_host, target_port = want_host, want_port
+
+        try:
+            upstream = socket.create_connection((target_host, target_port), timeout=15)
+        except OSError as exc:
+            return self._json(502, {"ok": False, "error": "cannot reach sshd: %s" % exc})
+        # 15s applies to the connect only: create_connection leaves its timeout
+        # set on the socket, and a read timeout here would look like EOF in
+        # ws_bridge, tearing down every tunnel after 15s of sshd silence.
+        # Idle tunnels are governed by HTTPS_SSH_IDLE instead.
+        upstream.settimeout(None)
+        upstream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if self.headers.get("Upgrade", "").lower() != "websocket" or not key:
+            upstream.close()
+            return self._json(426, {
+                "ok": False,
+                "error": "this endpoint needs a websocket upgrade "
+                         "(Upgrade: websocket + Sec-WebSocket-Key)",
+            })
+
+        log("TUNNEL OPEN  %s@%s:%d (client %s)" % (rec["user"], target_host, target_port, ip))
+        self.wfile.write(
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: " + ws_accept(key).encode() + b"\r\n\r\n"
+        )
+        self.wfile.flush()
+        self.close_connection = True
+
+        # rbufsize = 0 guarantees no bytes were buffered past the headers, so
+        # the websocket can read straight from the connection.
+        ws = WebSocket(self.connection, mask=False)
+        ws_bridge(ws, upstream, IDLE_TIMEOUT)
+        log("TUNNEL CLOSE %s@%s:%d" % (rec["user"], target_host, target_port))
+
+
+# --------------------------------------------------------------------------- #
+# serve
+# --------------------------------------------------------------------------- #
+def cmd_serve(args):
+    ensure_state_dir()
+    host = args.host or "127.0.0.1"
+    port = args.port or DEFAULT_PORT
+    ssh_port = args.ssh_port or DEFAULT_SSH_PORT
+    secret = args.secret or os.environ.get("HTTPS_SSH_SECRET") or ""
+    set_log_file(args.log)
+
+    httpd = ThreadingHTTPServer((host, port), Gateway)
+    httpd.daemon_threads = True
+    httpd.gateway_secret = secret
+    httpd.default_ssh_port = ssh_port
+
+    log("https-ssh %s listening on http://%s:%d" % (VERSION, host, port))
+    log("sshd is expected on port %d (used when a login request omits \"port\")" % ssh_port)
+    log("login log: %s" % LOG_FILE)
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        if not secret:
+            log("WARNING: bound to %s with no gateway secret set. Anyone who can reach "
+                "this port can attempt logins against your sshd." % host)
+            log("         set HTTPS_SSH_SECRET=... or use --secret to require X-Gateway-Secret.")
+        else:
+            log("gateway secret required (send header X-Gateway-Secret)")
+    log("publish it with:  cloudflared tunnel --url http://127.0.0.1:%d" % port)
+    log("then from a client: https-ssh connect user@host -g https://<your-tunnel-url>")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        log("shutting down")
+    finally:
+        httpd.server_close()
+
+
+# --------------------------------------------------------------------------- #
+# client: login
+# --------------------------------------------------------------------------- #
+def http_post(url, payload, headers=None, timeout=60):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read().decode())
+        except Exception:
+            return exc.code, {"ok": False, "error": "HTTP %d" % exc.code}
+    except Exception as exc:
+        return 0, {"ok": False, "error": "cannot reach gateway: %s" % exc}
+
+
+def do_login(gateway, user, host, port, password=None, key=None, secret=None, quiet=False):
+    headers = {"X-Gateway-Secret": secret} if secret else {}
+    body = {"host": host, "port": port, "user": user}
+    if password is not None:
+        body["password"] = password
+    if key:
+        body["key"] = key
+    status, resp = http_post(gateway.rstrip("/") + "/login", body, headers)
+    if status != 200 or not resp.get("ok"):
+        raise SystemExit("login failed: %s" % resp.get("error", "HTTP %d" % status))
+    sessions = load_sessions()
+    sessions[session_key(gateway, user, host, port)] = {
+        "token": resp["token"], "gateway": gateway.rstrip("/"),
+        "user": user, "host": host, "port": port,
+        "expires": time.time() + resp.get("expires_in", TOKEN_TTL),
+        "secret": secret or "",
+    }
+    save_sessions(sessions)
+    if not quiet:
+        log("authenticated %s@%s:%d via %s" % (user, host, port, resp.get("method")))
+    return resp["token"]
+
+
+def stored_session(gateway, user, host, port):
+    rec = load_sessions().get(session_key(gateway, user, host, port))
+    if not rec or rec.get("expires", 0) < time.time() + 5:
+        return None
+    return rec
+
+
+def cmd_login(args):
+    user, host, port = split_target(args.target, args.ssh_port)
+    password = args.password
+    if password is None and not args.key:
+        password = prompt_password(user, host)
+    do_login(args.gateway, user, host, port, password, args.key, args.secret)
+
+
+def cmd_logout(args):
+    sessions = load_sessions()
+    if args.target:
+        user, host, port = split_target(args.target, args.ssh_port)
+        key = session_key(args.gateway, user, host, port)
+        gone = sessions.pop(key, None) is not None
+    else:
+        gone = bool(sessions)
+        sessions = {}
+    save_sessions(sessions)
+    log("logged out" if gone else "nothing stored")
+
+
+def cmd_status(args):
+    sessions = load_sessions()
+    if not sessions:
+        print("no stored sessions")
+        return
+    for key, rec in sessions.items():
+        left = int(rec.get("expires", 0) - time.time())
+        state = "valid" if left > 0 else "expired"
+        print("%-45s %-8s %s" % (key, state, ("in %ds" % left) if left > 0 else ""))
+
+
+# --------------------------------------------------------------------------- #
+# client: proxy (raw tunnel, used by ssh -o ProxyCommand)
+# --------------------------------------------------------------------------- #
+def open_tunnel(gateway, token, host, port, secret=None, timeout=30):
+    """Open a websocket to /tunnel; returns a WebSocket speaking raw sshd bytes."""
+    url = urlparse(gateway if "://" in gateway else "http://" + gateway)
+    tls = url.scheme == "https"
+    netloc = url.netloc or url.path
+    if ":" in netloc:
+        g_host, _, g_port = netloc.rpartition(":")
+    else:
+        g_host, g_port = netloc, ("443" if tls else "80")
+    sock = socket.create_connection((g_host, int(g_port)), timeout=timeout)
+    if tls:
+        ctx = ssl.create_default_context()
+        sock = ctx.wrap_socket(sock, server_hostname=g_host.split(":")[0])
+    sock.settimeout(timeout)
+
+    key = base64.b64encode(os.urandom(16)).decode()
+    lines = [
+        "GET %s/tunnel HTTP/1.1" % (url.path.rstrip("/") or ""),
+        "Host: %s" % netloc,
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        "Sec-WebSocket-Key: %s" % key,
+        "Sec-WebSocket-Version: 13",
+        "Authorization: Bearer %s" % token,
+        "X-SSH-Host: %s" % host,
+        "X-SSH-Port: %d" % port,
+        "User-Agent: https-ssh/%s" % VERSION,
+    ]
+    if secret:
+        lines.append("X-Gateway-Secret: %s" % secret)
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    lines_out = head.decode("latin1").split("\r\n")
+    status_line = lines_out[0]
+    headers = {}
+    for line in lines_out[1:]:
+        if ":" in line:
+            k, _, v = line.partition(":")
+            headers[k.strip().lower()] = v.strip()
+
+    if status_line.split(" ")[1:2] != ["101"]:
+        detail = rest.decode("utf-8", "replace").strip()
+        try:
+            detail = json.loads(detail).get("error", detail)
+        except Exception:
+            pass
+        sock.close()
+        raise SystemExit("gateway refused the tunnel: %s %s" % (status_line, detail))
+    if headers.get("sec-websocket-accept") != ws_accept(key):
+        sock.close()
+        raise SystemExit("gateway sent a bad websocket handshake (Sec-WebSocket-Accept mismatch)")
+
+    sock.settimeout(None)
+    return WebSocket(sock, mask=True, initial=rest)
+
+
+def cmd_proxy(args):
+    """Bridge stdin/stdout to sshd. This is what ssh calls as its ProxyCommand."""
+    host, port = args.host, args.port
+    user = args.user or os.environ.get("HTTPS_SSH_USER") or os.environ.get("USER", "root")
+    gateway = args.gateway
+    rec = stored_session(gateway, user, host, port)
+    if not rec:
+        raise SystemExit(
+            "no valid session for %s@%s:%d on %s\nrun: https-ssh login %s@%s -g %s"
+            % (user, host, port, gateway, user, host, gateway)
+        )
+
+    ws = open_tunnel(gateway, rec["token"], host, port, rec.get("secret"))
+    ws_client_bridge(ws, sys.stdin.fileno(), sys.stdout.fileno(), IDLE_TIMEOUT)
+
+
+# --------------------------------------------------------------------------- #
+# client: connect (login + real interactive ssh)
+# --------------------------------------------------------------------------- #
+def self_command():
+    """The command ssh should use to reach our proxy subcommand."""
+    installed = shutil.which("https-ssh")
+    if installed:
+        return shlex.quote(installed)
+    return "%s %s" % (shlex.quote(sys.executable), shlex.quote(os.path.abspath(sys.argv[0])))
+
+
+def cmd_connect(args):
+    user, host, port = split_target(args.target, args.ssh_port)
+    gateway = args.gateway
+    secret = args.secret or os.environ.get("HTTPS_SSH_SECRET") or ""
+
+    password = args.password
+    rec = stored_session(gateway, user, host, port)
+    if rec is None or args.force_login:
+        if password is None and not args.key:
+            password = prompt_password(user, host)
+        do_login(gateway, user, host, port, password, args.key, secret or None)
+        rec = stored_session(gateway, user, host, port)
+
+    if args.key:
+        rec["secret"] = secret
+        # make the proxy subprocess see the same session
+        sessions = load_sessions()
+        sessions[session_key(gateway, user, host, port)] = rec
+        save_sessions(sessions)
+
+    proxy_cmd = "%s proxy %s %d -u %s -g %s" % (
+        self_command(), shlex.quote(host), port, shlex.quote(user), shlex.quote(gateway),
+    )
+    ssh = shutil.which("ssh") or "ssh"
+    cmd = [ssh, "-o", "ProxyCommand=" + proxy_cmd, "-p", str(port),
+           "-o", "StrictHostKeyChecking=accept-new"]
+
+    # Reuse the password we already verified so ssh does not ask again.
+    # The secret is handed over through an environment variable and a throwaway
+    # askpass helper - it is never written to disk.
+    env = dict(os.environ)
+    tmp = None
+    if password is not None and not args.key:
+        fd, helper = tempfile.mkstemp(prefix="https-ssh-askpass-")
+        os.write(fd, b"#!/bin/sh\nprintf '%s\\n' \"$HTTPS_SSH_PW\"\n")
+        os.close(fd)
+        os.chmod(helper, 0o700)
+        tmp = helper
+        env["SSH_ASKPASS"] = helper
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        env["DISPLAY"] = env.get("DISPLAY", ":0")
+        env["HTTPS_SSH_PW"] = password
+        cmd += ["-o", "PreferredAuthentications=password,keyboard-interactive",
+                "-o", "NumberOfPasswordPrompts=1"]
+    elif args.key:
+        cmd += ["-i", os.path.expanduser(args.key), "-o", "IdentitiesOnly=yes"]
+
+    cmd += ["%s@%s" % (user, host)]
+    cmd += args.ssh_args   # remote command / extra ssh args, after the host like ssh(1)
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        cmd.insert(1, "-t")   # interactive: keep a real tty on the far side
+
+    try:
+        proc = subprocess.run(cmd, env=env)
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    sys.exit(proc.returncode)
+
+
+def cmd_exec(args):
+    user, host, port = split_target(args.target, args.ssh_port)
+    gateway = args.gateway
+    secret = args.secret or os.environ.get("HTTPS_SSH_SECRET") or ""
+    rec = stored_session(gateway, user, host, port)
+    if rec is None or args.force_login:
+        password = args.password
+        if password is None and not args.key:
+            password = prompt_password(user, host)
+        do_login(gateway, user, host, port, password, args.key, secret or None)
+        rec = stored_session(gateway, user, host, port)
+    command = " ".join(args.command)
+    if not command.strip():
+        raise SystemExit("usage: https-ssh exec [options] USER@HOST -- COMMAND")
+    status, resp = http_post(
+        gateway.rstrip("/") + "/exec",
+        {"token": rec["token"], "command": command},
+        {"X-Gateway-Secret": secret} if secret else {},
+    )
+    if resp.get("stdout"):
+        sys.stdout.write(resp["stdout"])
+    if resp.get("stderr"):
+        sys.stderr.write(resp["stderr"])
+    if status != 200:
+        sys.stderr.write("error: %s\n" % resp.get("error"))
+        sys.exit(1)
+    sys.exit(resp.get("exit_code", 1))
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="https-ssh",
+        description="Run SSH over HTTP/HTTPS (for Cloudflare Tunnel and friends).",
+        epilog="With no subcommand, the options alone start the service: "
+               "https-ssh --port 8899 --ssh 22",
+    )
+    p.add_argument("--version", action="version", version="https-ssh " + VERSION)
+
+    def server_opts(sp, suppress=False):
+        # On the subcommand we use SUPPRESS so that a value given at the top
+        # level (https-ssh --port X serve) is not overwritten by the default.
+        d = argparse.SUPPRESS if suppress else None
+        sp.add_argument("--host", default=d,
+                        help="address the service binds to (default 127.0.0.1)")
+        sp.add_argument("--port", type=int, default=d,
+                        help="port the service listens on (default %d)" % DEFAULT_PORT)
+        sp.add_argument("--ssh", dest="ssh_port", type=int, default=d,
+                        help="port sshd is running on (default %d)" % DEFAULT_SSH_PORT)
+        sp.add_argument("--secret", default=d,
+                        help="require header X-Gateway-Secret on /login")
+        sp.add_argument("--log", default=d,
+                        help="login log file (default %s)" % LOG_FILE)
+
+    # top level, so `https-ssh --port 8899 --ssh 22` works on its own
+    server_opts(p)
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("serve", help="run the HTTP->SSH gateway (the service)")
+    server_opts(s, suppress=True)
+    s.set_defaults(func=cmd_serve)
+
+    def client_opts(sp):
+        sp.add_argument("target", help="USER@HOST or USER@HOST:PORT")
+        sp.add_argument("-g", "--gateway", default=DEFAULT_GATEWAY, help="gateway URL")
+        # SUPPRESS so a top-level --ssh / --secret is inherited
+        sp.add_argument("--ssh-port", "--ssh", dest="ssh_port", type=int,
+                        default=argparse.SUPPRESS,
+                        help="target sshd port (default %d)" % DEFAULT_SSH_PORT)
+        sp.add_argument("-p", "--password", default=None, help="SSH password (otherwise prompt)")
+        sp.add_argument("-i", "--key", default=None, help="SSH private key instead of a password")
+        sp.add_argument("--secret", default=argparse.SUPPRESS,
+                        help="X-Gateway-Secret, if the gateway needs one")
+        sp.add_argument("--force-login", action="store_true", help="re-authenticate even if a token exists")
+
+    l = sub.add_parser("login", help="POST credentials to /login and store the token")
+    client_opts(l)
+    l.set_defaults(func=cmd_login)
+
+    c = sub.add_parser("connect", help="login then open a real interactive ssh session")
+    client_opts(c)
+    c.set_defaults(func=cmd_connect, ssh_args=[])
+
+    x = sub.add_parser("exec", help="run one command through the gateway (HTTPS only)")
+    client_opts(x)
+    x.set_defaults(func=cmd_exec, command=[])
+
+    pr = sub.add_parser("proxy", help="websocket tunnel client, used as ssh ProxyCommand")
+    pr.add_argument("host")
+    pr.add_argument("port", type=int)
+    pr.add_argument("-u", "--user", default=None)
+    pr.add_argument("-g", "--gateway", default=DEFAULT_GATEWAY)
+    pr.set_defaults(func=cmd_proxy)
+
+    st = sub.add_parser("status", help="list stored session tokens")
+    st.set_defaults(func=cmd_status)
+
+    lo = sub.add_parser("logout", help="drop stored session tokens")
+    lo.add_argument("target", nargs="?", help="USER@HOST to drop (all if omitted)")
+    lo.add_argument("-g", "--gateway", default=DEFAULT_GATEWAY)
+    lo.add_argument("--ssh-port", "--ssh", dest="ssh_port", type=int,
+                    default=argparse.SUPPRESS)
+    lo.set_defaults(func=cmd_logout)
+    return p
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # For connect/exec, everything after the first standalone "--" is passed
+    # through verbatim (the remote command / extra ssh args), and options are
+    # still parsed normally even when they come before the subcommand.
+    before, tail = argv, []
+    had_dashdash = "--" in argv
+    if had_dashdash:
+        cut = argv.index("--")
+        before, tail = argv[:cut], argv[cut + 1:]
+
+    parser = build_parser()
+    args = parser.parse_args(before)
+
+    if args.cmd not in ("connect", "exec"):
+        tail = []
+        if had_dashdash:
+            # not a passthrough command: let argparse treat "--" its usual way
+            args = parser.parse_args(argv)
+
+    # `https-ssh --port 9000 --ssh 2222` (no subcommand) means "run the service"
+    if not args.cmd:
+        if any(v is not None for v in (args.port, args.host, args.ssh_port, args.secret, args.log)):
+            args.cmd = "serve"
+            args.func = cmd_serve
+        else:
+            parser.print_help()
+            return 0
+
+    args.host = getattr(args, "host", None) or os.environ.get("HTTPS_SSH_HOST") or "127.0.0.1"
+    args.port = getattr(args, "port", None) or env_int("HTTPS_SSH_PORT", DEFAULT_PORT)
+    args.ssh_port = getattr(args, "ssh_port", None) or env_int("HTTPS_SSH_SSH_PORT", DEFAULT_SSH_PORT)
+    args.secret = getattr(args, "secret", None)
+    args.log = getattr(args, "log", None)
+
+    if args.cmd == "connect":
+        args.ssh_args = tail
+    elif args.cmd == "exec":
+        args.command = tail
+
+    ensure_state_dir()
+    return args.func(args) or 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

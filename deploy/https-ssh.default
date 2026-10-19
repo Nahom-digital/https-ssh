@@ -1,0 +1,36 @@
+# /etc/default/https-ssh
+#
+# Configuration for the https-ssh systemd service.
+#
+# Change anything below, then apply it with:
+#     systemctl restart https-ssh
+# (a watcher unit is installed, so the service also restarts by itself
+#  automatically whenever you save this file.)
+
+# ---- where the https-ssh service listens ---------------------------------- #
+# This is the local HTTP port that cloudflared publishes, e.g.
+#     cloudflared tunnel --url http://127.0.0.1:9000
+HTTPS_SSH_HOST=127.0.0.1
+HTTPS_SSH_PORT=9000
+
+# ---- where sshd is running on this machine --------------------------------- #
+# Used whenever a login request does not carry its own "port" field.
+HTTPS_SSH_SSH_PORT=2208
+
+# ---- optional shared secret ----------------------------------------------- #
+# If set, /login also requires the header:  X-Gateway-Secret: <value>
+# Leave empty to disable.
+HTTPS_SSH_SECRET=
+
+# ---- login log ------------------------------------------------------------ #
+# Every login attempt (success and failure) is appended here. When unset, the
+# log is written to log.json next to the application.
+# HTTPS_SSH_LOG=/var/log/https-ssh.json
+
+# ---- tuning --------------------------------------------------------------- #
+# Token lifetime in seconds (default 28800 = 8h).
+HTTPS_SSH_TTL=28800
+# Close an idle tunnel after this many seconds (default 900).
+HTTPS_SSH_IDLE=900
+# Keep at most this many entries in the login log (default 5000).
+HTTPS_SSH_LOG_MAX=5000

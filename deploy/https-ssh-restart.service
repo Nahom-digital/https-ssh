@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart https-ssh after its configuration changes
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart https-ssh.service

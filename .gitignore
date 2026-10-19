@@ -1,0 +1,15 @@
+# runtime / local state
+log.json
+.https-ssh-client.json
+*.log
+*.tmp
+
+# python
+__pycache__/
+*.py[cod]
+
+# editor / os
+.DS_Store
+*.swp
+.idea/
+.vscode/
