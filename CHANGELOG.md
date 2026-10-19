@@ -16,6 +16,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
 - `--no-service` flag to skip the offer and always run in the foreground.
 - The client installs itself as both `https-ssh-client` and the short alias
   `hsc` on first run, and `install.sh` creates both links.
+- The installed client commands are tiny launchers that call the script with
+  `bash`, and the script restores its own executable bit if it was lost. A
+  copy made with zip/scp or a stale link no longer fails with
+  "permission denied".
 - README now lists every command and flag for the gateway, the built-in
   client subcommands and `https-ssh-client`, including `--forget`.
 

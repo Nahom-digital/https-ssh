@@ -138,7 +138,9 @@ Client script (`https-ssh-client`, short name `hsc`):
 - `-- ARGS` - pass ARGS straight to ssh (`-- uptime`, `-- -L 8080:localhost:80`)
 
 The client saves your answers (never passwords or keys) in
-`~/.https-ssh-client.json`; `--forget` wipes them (`hsc --forget`).
+`~/.https-ssh-client.json`; `--forget` wipes them (`hsc --forget`). If the
+script was copied without its executable bit, the next run fixes it and
+reinstalls the commands automatically.
 
 ## License
 

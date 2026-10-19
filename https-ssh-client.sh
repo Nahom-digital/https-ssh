@@ -123,15 +123,40 @@ if command -v readlink >/dev/null 2>&1; then
     SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 fi
 
-link_self() {
-    ln -sf "$SELF" "$1/https-ssh-client" 2>/dev/null || return 1
-    ln -sf "$SELF" "$1/hsc" 2>/dev/null || return 1
-    INSTALLED_TO="$1"
+# If the file was copied without its executable bit (zip, scp, some sync
+# tools), fix it now: `bash script.sh` works without it, executing does not.
+if [ -f "$SELF" ] && [ ! -x "$SELF" ]; then
+    if chmod +x "$SELF" 2>/dev/null; then
+        say "made $SELF executable"
+    else
+        say "note: could not make $SELF executable (try: chmod +x \"$SELF\")"
+    fi
+fi
+
+# The commands are installed as tiny `sh` launchers instead of symlinks:
+# `bash script.sh` only needs read permission, so they also work when the
+# script itself has no executable bit.
+launcher_text() {
+    printf '#!/bin/sh\n'
+    printf '# launcher for %s - installed by https-ssh-client\n' "$SELF"
+    printf 'exec bash %s "$@"\n' "$(printf '%q' "$SELF")"
+}
+
+write_launcher() {   # $1 = destination file
+    rm -f "$1" 2>/dev/null || return 1
+    launcher_text > "$1" 2>/dev/null || return 1
+    chmod 755 "$1" 2>/dev/null || true
     return 0
 }
 
+have_cmd() {         # true when $1 resolves to an executable file
+    local p
+    p=$(command -v "$1" 2>/dev/null) || return 1
+    [ -n "$p" ] && [ -x "$p" ]
+}
+
 install_self() {
-    local dir
+    local dir tmp
     # prefer a writable directory that is already on PATH
     for dir in /usr/local/bin "$HOME/.local/bin" "$HOME/bin"; do
         case ":$PATH:" in
@@ -139,20 +164,33 @@ install_self() {
             *) continue ;;
         esac
         [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || continue
-        if [ -w "$dir" ] && link_self "$dir"; then
-            return 0
-        fi
-        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null \
-           && sudo ln -sf "$SELF" "$dir/https-ssh-client" 2>/dev/null \
-           && sudo ln -sf "$SELF" "$dir/hsc" 2>/dev/null; then
+        if [ -w "$dir" ] && write_launcher "$dir/https-ssh-client" \
+                          && write_launcher "$dir/hsc"; then
             INSTALLED_TO="$dir"
             return 0
+        fi
+        # /usr/local/bin without write permission: use sudo when it is free
+        if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            tmp=$(mktemp -d 2>/dev/null) || continue
+            if write_launcher "$tmp/https-ssh-client" \
+               && write_launcher "$tmp/hsc" \
+               && sudo rm -f "$dir/https-ssh-client" "$dir/hsc" 2>/dev/null \
+               && sudo cp "$tmp/https-ssh-client" "$dir/https-ssh-client" 2>/dev/null \
+               && sudo cp "$tmp/hsc" "$dir/hsc" 2>/dev/null \
+               && sudo chmod 755 "$dir/https-ssh-client" "$dir/hsc" 2>/dev/null; then
+                rm -rf "$tmp"
+                INSTALLED_TO="$dir"
+                return 0
+            fi
+            rm -rf "$tmp"
         fi
     done
     # otherwise fall back to ~/.local/bin and tell the user to extend PATH
     for dir in "$HOME/.local/bin" "$HOME/bin"; do
         mkdir -p "$dir" 2>/dev/null || continue
-        if [ -w "$dir" ] && link_self "$dir"; then
+        if [ -w "$dir" ] && write_launcher "$dir/https-ssh-client" \
+                          && write_launcher "$dir/hsc"; then
+            INSTALLED_TO="$dir"
             return 0
         fi
     done
@@ -160,8 +198,8 @@ install_self() {
 }
 
 INSTALLED_TO=""
-if command -v https-ssh-client >/dev/null 2>&1 && command -v hsc >/dev/null 2>&1; then
-    :   # both commands are already available
+if have_cmd https-ssh-client && have_cmd hsc; then
+    :   # both commands are already available and executable
 elif install_self; then
     say "installed commands: $INSTALLED_TO/https-ssh-client and $INSTALLED_TO/hsc"
     case ":$PATH:" in
