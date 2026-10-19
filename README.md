@@ -33,10 +33,11 @@ sh install.sh
 ```
 
 Requires Linux, Python 3.7+ (stdlib only) and OpenSSH. No pip, no other
-dependencies. The installer puts two commands on your PATH:
+dependencies. The installer puts three commands on your PATH:
 
 - `https-ssh` - the gateway server and CLI
 - `https-ssh-client` - interactive client that connects over HTTPS
+- `hsc` - short alias for `https-ssh-client`
 
 ## Run the gateway
 
@@ -68,7 +69,7 @@ The hostname that `cloudflared` prints is the URL clients use.
 ## Connect
 
 ```sh
-https-ssh-client
+https-ssh-client        # or simply: hsc
 ```
 
 The client asks for the gateway URL and your SSH user once, logs in, and opens
@@ -124,7 +125,7 @@ Built-in client subcommands (the same `https-ssh` command, handy for scripts):
 - common options: `-g/--gateway URL`, `-p/--password`, `-i/--key FILE`,
   `--ssh-port PORT`, `--secret S`, `--force-login`
 
-Client script (`https-ssh-client`):
+Client script (`https-ssh-client`, short name `hsc`):
 
 - `-g, --gateway URL` - gateway to connect to
 - `-u, --user USER` - SSH user
@@ -137,7 +138,7 @@ Client script (`https-ssh-client`):
 - `-- ARGS` - pass ARGS straight to ssh (`-- uptime`, `-- -L 8080:localhost:80`)
 
 The client saves your answers (never passwords or keys) in
-`~/.https-ssh-client.json`; `--forget` wipes them.
+`~/.https-ssh-client.json`; `--forget` wipes them (`hsc --forget`).
 
 ## License
 

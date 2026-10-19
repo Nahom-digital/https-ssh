@@ -14,6 +14,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
   choice and keeps running in the foreground.
 - `--service` flag to install or refresh the systemd service and exit.
 - `--no-service` flag to skip the offer and always run in the foreground.
+- The client installs itself as both `https-ssh-client` and the short alias
+  `hsc` on first run, and `install.sh` creates both links.
 - README now lists every command and flag for the gateway, the built-in
   client subcommands and `https-ssh-client`, including `--forget`.
 

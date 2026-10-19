@@ -1,11 +1,12 @@
 #!/bin/sh
 # install.sh - make the https-ssh commands available in every terminal.
 #
-# Installs two symlinks into the first writable directory that is already on
+# Installs three symlinks into the first writable directory that is already on
 # PATH (/usr/local/bin, ~/.local/bin or ~/bin):
 #
 #     https-ssh          the server / gateway and client CLI
 #     https-ssh-client   the interactive "connect over HTTPS" helper
+#     hsc                short alias for https-ssh-client
 #
 # Run as your normal user; sudo is only used if /usr/local/bin needs it.
 
@@ -50,8 +51,10 @@ fi
 
 ${SUDO:-} ln -sf "$LAUNCHER" "$TARGET/https-ssh"
 ${SUDO:-} ln -sf "$CLIENT"   "$TARGET/https-ssh-client"
+${SUDO:-} ln -sf "$CLIENT"   "$TARGET/hsc"
 echo "installed: $TARGET/https-ssh        -> $LAUNCHER"
 echo "installed: $TARGET/https-ssh-client -> $CLIENT"
+echo "installed: $TARGET/hsc              -> $CLIENT"
 
 if command -v https-ssh >/dev/null 2>&1; then
     echo "ready:  $(command -v https-ssh)"

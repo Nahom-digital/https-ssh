@@ -18,7 +18,7 @@
 #
 set -u
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 CONFIG="$HOME/.https-ssh-client.json"
 WS_URL="https://github.com/vi/websocat/releases/latest/download/websocat.x86_64-unknown-linux-musl"
 
@@ -27,7 +27,8 @@ say() { printf '%s\n' "$*" >&2; }
 
 usage() {
     cat <<'EOF'
-https-ssh-client.sh - plain `ssh` over an https-ssh gateway (WebSocket/TLS)
+https-ssh-client - plain `ssh` over an https-ssh gateway (WebSocket/TLS)
+                   (first run installs itself as `https-ssh-client` and `hsc`)
 
 options:
   -g, --gateway URL    gateway base URL, e.g. https://ssh.example.com
@@ -115,12 +116,19 @@ fi
 # --------------------------------------------------------------------------
 command -v ssh >/dev/null 2>&1 || die "the 'ssh' binary was not found in PATH"
 
-# Install this script as the `https-ssh-client` command on first run, so it can
-# be started from any directory afterwards.
+# Install this script as the `https-ssh-client` and `hsc` commands on first
+# run, so it can be started from any directory afterwards.
 SELF="$0"
 if command -v readlink >/dev/null 2>&1; then
     SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 fi
+
+link_self() {
+    ln -sf "$SELF" "$1/https-ssh-client" 2>/dev/null || return 1
+    ln -sf "$SELF" "$1/hsc" 2>/dev/null || return 1
+    INSTALLED_TO="$1"
+    return 0
+}
 
 install_self() {
     local dir
@@ -131,12 +139,12 @@ install_self() {
             *) continue ;;
         esac
         [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || continue
-        if [ -w "$dir" ] && ln -sf "$SELF" "$dir/https-ssh-client" 2>/dev/null; then
-            INSTALLED_TO="$dir"
+        if [ -w "$dir" ] && link_self "$dir"; then
             return 0
         fi
         if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null \
-           && sudo ln -sf "$SELF" "$dir/https-ssh-client" 2>/dev/null; then
+           && sudo ln -sf "$SELF" "$dir/https-ssh-client" 2>/dev/null \
+           && sudo ln -sf "$SELF" "$dir/hsc" 2>/dev/null; then
             INSTALLED_TO="$dir"
             return 0
         fi
@@ -144,8 +152,7 @@ install_self() {
     # otherwise fall back to ~/.local/bin and tell the user to extend PATH
     for dir in "$HOME/.local/bin" "$HOME/bin"; do
         mkdir -p "$dir" 2>/dev/null || continue
-        if [ -w "$dir" ] && ln -sf "$SELF" "$dir/https-ssh-client" 2>/dev/null; then
-            INSTALLED_TO="$dir"
+        if [ -w "$dir" ] && link_self "$dir"; then
             return 0
         fi
     done
@@ -153,16 +160,16 @@ install_self() {
 }
 
 INSTALLED_TO=""
-if command -v https-ssh-client >/dev/null 2>&1; then
-    :   # already available as a command
+if command -v https-ssh-client >/dev/null 2>&1 && command -v hsc >/dev/null 2>&1; then
+    :   # both commands are already available
 elif install_self; then
-    say "installed command: $INSTALLED_TO/https-ssh-client"
+    say "installed commands: $INSTALLED_TO/https-ssh-client and $INSTALLED_TO/hsc"
     case ":$PATH:" in
         *":$INSTALLED_TO:"*) ;;
-        *) say "note: add $INSTALLED_TO to PATH to use it from any directory" ;;
+        *) say "note: add $INSTALLED_TO to PATH to use them from any directory" ;;
     esac
 else
-    say "note: could not install the https-ssh-client command (no writable bin directory)"
+    say "note: could not install the commands (no writable bin directory on PATH)"
 fi
 
 find_websocat() {
