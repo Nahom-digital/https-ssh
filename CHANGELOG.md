@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-10-19
+
+### Added
+- First-run service offer: when the gateway starts in an interactive terminal
+  for the first time it asks "Do you want https-ssh to run as a systemd
+  service? (y/n)". `y` writes the systemd units and `/etc/default/https-ssh`,
+  enables the service and starts it now and on every boot; `n` remembers the
+  choice and keeps running in the foreground.
+- `--service` flag to install or refresh the systemd service and exit.
+- `--no-service` flag to skip the offer and always run in the foreground.
+- README now lists every command and flag for the gateway, the built-in
+  client subcommands and `https-ssh-client`, including `--forget`.
+
 ## [1.1.0] - 2026-10-19
 
 ### Added

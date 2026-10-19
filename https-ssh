@@ -58,7 +58,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_PORT = 8899          # where the https-ssh service listens
 DEFAULT_SSH_PORT = 22        # where sshd is expected to listen
 DEFAULT_GATEWAY = os.environ.get("HTTPS_SSH_GATEWAY", "http://127.0.0.1:%d" % DEFAULT_PORT)
@@ -110,6 +110,260 @@ def save_sessions(data):
 
 def session_key(gateway, user, host, port):
     return "%s|%s@%s:%d" % (gateway.rstrip("/"), user, host, port)
+
+
+# --------------------------------------------------------------------------- #
+# first run: offer to install the systemd service
+# --------------------------------------------------------------------------- #
+SYSTEMD_DIR = os.environ.get("HTTPS_SSH_SYSTEMD_DIR", "/etc/systemd/system")
+DEFAULTS_FILE = os.environ.get("HTTPS_SSH_DEFAULTS_FILE", "/etc/default/https-ssh")
+SERVICE_ASKED = os.path.join(STATE_DIR, "service-asked")
+
+
+def _service_unit_text(exec_start, port, ssh_port):
+    return """[Unit]
+Description=https-ssh - SSH over HTTP/HTTPS gateway (port %d -> sshd %d)
+Documentation=https://github.com/Nahom-digital/https-ssh#readme
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=-%s
+ExecStart=%s serve
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+""" % (port, ssh_port, DEFAULTS_FILE, exec_start)
+
+
+def _restart_units_text():
+    path_unit = """[Unit]
+Description=Watch %s and restart https-ssh on change
+
+[Path]
+PathChanged=%s
+Unit=https-ssh-restart.service
+
+[Install]
+WantedBy=multi-user.target
+""" % (DEFAULTS_FILE, DEFAULTS_FILE)
+    service_unit = """[Unit]
+Description=Restart https-ssh after its configuration changes
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart https-ssh.service
+"""
+    return path_unit, service_unit
+
+
+def _read_defaults():
+    """The HTTPS_SSH_* values already present in /etc/default/https-ssh."""
+    wanted = ("HTTPS_SSH_HOST", "HTTPS_SSH_PORT", "HTTPS_SSH_SSH_PORT",
+              "HTTPS_SSH_SECRET", "HTTPS_SSH_LOG",
+              "HTTPS_SSH_TTL", "HTTPS_SSH_IDLE", "HTTPS_SSH_LOG_MAX")
+    got = {}
+    try:
+        with open(DEFAULTS_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key in wanted:
+                    got[key] = value
+    except OSError:
+        pass
+    return got
+
+
+def _effective_config(args):
+    """Settings for the service: command line flags win, then the values
+    already in /etc/default/https-ssh, then the current defaults."""
+    existing = _read_defaults()
+    explicit = getattr(args, "_explicit", set())
+
+    def pick(key, attr, fallback, cast=None):
+        if key in existing and attr not in explicit:
+            raw = existing[key]
+            if raw == "":
+                return fallback
+            if cast:
+                try:
+                    return cast(raw)
+                except ValueError:
+                    return fallback
+            return raw
+        return getattr(args, attr, fallback)
+
+    return {
+        "host": pick("HTTPS_SSH_HOST", "host", "127.0.0.1"),
+        "port": pick("HTTPS_SSH_PORT", "port", DEFAULT_PORT, int),
+        "ssh_port": pick("HTTPS_SSH_SSH_PORT", "ssh_port", DEFAULT_SSH_PORT, int),
+        "secret": pick("HTTPS_SSH_SECRET", "secret", "") or "",
+        "log": pick("HTTPS_SSH_LOG", "log", None),
+        "ttl": pick("HTTPS_SSH_TTL", "ttl", TOKEN_TTL, int),
+        "idle": pick("HTTPS_SSH_IDLE", "idle", IDLE_TIMEOUT, int),
+        "log_max": pick("HTTPS_SSH_LOG_MAX", "log_max", LOG_MAX, int),
+    }
+
+
+def _defaults_text(cfg):
+    log_line = ("HTTPS_SSH_LOG=%s" % cfg["log"]) if cfg["log"] \
+        else "# HTTPS_SSH_LOG=/var/log/https-ssh.json"
+    return """# /etc/default/https-ssh
+#
+# Configuration for the https-ssh systemd service. Change anything below and
+# save the file: a watcher unit restarts the service automatically.
+
+# local HTTP port the gateway listens on, published by cloudflared
+HTTPS_SSH_HOST=%s
+HTTPS_SSH_PORT=%d
+
+# where sshd is running on this machine
+HTTPS_SSH_SSH_PORT=%d
+
+# optional shared secret; /login then also needs X-Gateway-Secret: <value>
+HTTPS_SSH_SECRET=%s
+
+# login log (unset = log.json next to the application)
+%s
+
+# tuning
+HTTPS_SSH_TTL=%d
+HTTPS_SSH_IDLE=%d
+HTTPS_SSH_LOG_MAX=%d
+""" % (cfg["host"], cfg["port"], cfg["ssh_port"], cfg["secret"], log_line,
+       cfg["ttl"], cfg["idle"], cfg["log_max"])
+
+
+def _priv_prefix():
+    """Command prefix for system paths: [] as root, ['sudo'], or None."""
+    if os.geteuid() == 0:
+        return []
+    if shutil.which("sudo"):
+        return ["sudo"]
+    return None
+
+
+def _write_system_file(path, text, mode):
+    prefix = _priv_prefix()
+    if prefix is None:
+        return False
+    try:
+        if prefix:
+            subprocess.run(prefix + ["mkdir", "-p", os.path.dirname(path)],
+                           check=True)
+            subprocess.run(prefix + ["tee", path], input=text, text=True,
+                           stdout=subprocess.DEVNULL, check=True)
+            subprocess.run(prefix + ["chmod", "%o" % mode, path], check=True)
+        else:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+            os.chmod(path, mode)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def install_service(args):
+    """Write the systemd units + /etc/default file and start the service."""
+    exe = shutil.which("https-ssh")
+    if not exe:
+        launcher = os.path.join(APP_DIR, "https-ssh.sh")
+        exe = launcher if os.path.exists(launcher) else os.path.abspath(__file__)
+    path_unit, restart_unit = _restart_units_text()
+    cfg = _effective_config(args)
+    files = [
+        (os.path.join(SYSTEMD_DIR, "https-ssh.service"),
+         _service_unit_text(exe, cfg["port"], cfg["ssh_port"]), 0o644),
+        (os.path.join(SYSTEMD_DIR, "https-ssh-restart.path"), path_unit, 0o644),
+        (os.path.join(SYSTEMD_DIR, "https-ssh-restart.service"), restart_unit, 0o644),
+        (DEFAULTS_FILE, _defaults_text(cfg), 0o600 if cfg["secret"] else 0o644),
+    ]
+    for path, text, mode in files:
+        if not _write_system_file(path, text, mode):
+            log("could not write %s" % path)
+            log("install the service by hand as root: sudo https-ssh --service")
+            return 1
+
+    if SYSTEMD_DIR != "/etc/systemd/system":
+        return 0   # redirected to a custom prefix: files only, no systemctl
+
+    prefix = _priv_prefix() or []
+    try:
+        subprocess.run(prefix + ["systemctl", "daemon-reload"],
+                       stdout=subprocess.DEVNULL, check=True)
+        subprocess.run(prefix + ["systemctl", "enable", "--now",
+                                 "https-ssh.service", "https-ssh-restart.path"],
+                       stdout=subprocess.DEVNULL, check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        log("units written, but systemctl failed (%s)" % exc)
+        log("start it by hand: systemctl enable --now https-ssh.service https-ssh-restart.path")
+        return 1
+
+    for _ in range(10):
+        time.sleep(0.3)
+        rc = subprocess.run(prefix + ["systemctl", "is-active", "--quiet",
+                                      "https-ssh.service"]).returncode
+        if rc == 0:
+            log("https-ssh is running as a service: port %d -> sshd %d, starts on boot"
+                % (cfg["port"], cfg["ssh_port"]))
+            log("manage it with: systemctl status https-ssh | journalctl -u https-ssh -f")
+            return 0
+    log("the service was installed but is not active yet; check: systemctl status https-ssh")
+    return 1
+
+
+def _write_asked(what):
+    ensure_state_dir()
+    try:
+        with open(SERVICE_ASKED, "w") as f:
+            f.write(what + "\n")
+    except OSError:
+        pass
+
+
+def offer_service(args):
+    """First-run offer. Returns an exit code to stop, or None to keep serving."""
+    if getattr(args, "service", False):
+        return install_service(args)
+    if getattr(args, "no_service", False):
+        _write_asked("foreground")
+        return None
+    if os.path.exists(os.path.join(SYSTEMD_DIR, "https-ssh.service")):
+        return None
+    if os.path.exists(SERVICE_ASKED):
+        return None
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+
+    log("first run on this machine")
+    while True:
+        sys.stderr.write("Do you want https-ssh to run as a systemd service? (y/n): ")
+        sys.stderr.flush()
+        answer = sys.stdin.readline()
+        answer = (answer or "n").strip().lower()
+        if answer in ("y", "yes"):
+            rc = install_service(args)
+            if rc == 0:
+                _write_asked("service")
+                return rc
+            log("service setup failed; starting in the foreground instead")
+            return None
+        if answer in ("n", "no"):
+            _write_asked("foreground")
+            log("ok, running in the foreground "
+                "(install the service later with: https-ssh --service)")
+            return None
+        sys.stderr.write("please answer y or n\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -1287,6 +1541,12 @@ def build_parser():
                         help="require header X-Gateway-Secret on /login")
         sp.add_argument("--log", default=d,
                         help="login log file (default %s)" % LOG_FILE)
+        sp.add_argument("--service", action="store_true",
+                        default=argparse.SUPPRESS if suppress else False,
+                        help="install as a systemd service and start it, then exit")
+        sp.add_argument("--no-service", action="store_true",
+                        default=argparse.SUPPRESS if suppress else False,
+                        help="do not offer to install a systemd service")
 
     # top level, so `https-ssh --port 8899 --ssh 22` works on its own
     server_opts(p)
@@ -1361,9 +1621,20 @@ def main(argv=None):
             # not a passthrough command: let argparse treat "--" its usual way
             args = parser.parse_args(argv)
 
+    # remember which server options were given on the command line, so that
+    # --service keeps the other settings from the existing /etc/default file
+    args._explicit = {
+        key for opt, key in (("--host", "host"), ("--port", "port"),
+                             ("--ssh", "ssh_port"), ("--secret", "secret"),
+                             ("--log", "log"))
+        if any(a == opt or a.startswith(opt + "=") for a in argv)
+    }
+
     # `https-ssh --port 9000 --ssh 2222` (no subcommand) means "run the service"
     if not args.cmd:
-        if any(v is not None for v in (args.port, args.host, args.ssh_port, args.secret, args.log)):
+        if (any(v is not None for v in (args.port, args.host, args.ssh_port, args.secret, args.log))
+                or getattr(args, "service", False)
+                or getattr(args, "no_service", False)):
             args.cmd = "serve"
             args.func = cmd_serve
         else:
@@ -1375,6 +1646,12 @@ def main(argv=None):
     args.ssh_port = getattr(args, "ssh_port", None) or env_int("HTTPS_SSH_SSH_PORT", DEFAULT_SSH_PORT)
     args.secret = getattr(args, "secret", None)
     args.log = getattr(args, "log", None)
+
+    # First run of the gateway: ask whether it should become a service.
+    if args.cmd == "serve":
+        rc = offer_service(args)
+        if rc is not None:
+            return rc
 
     if args.cmd == "connect":
         args.ssh_args = tail
